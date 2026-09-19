@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:
-    from telegram import Update
+    from telegram import BotCommand, Update
     from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 except Exception:  # pragma: no cover
+    BotCommand = None
     Update = None
     ApplicationBuilder = None
     CommandHandler = None
@@ -14,9 +18,38 @@ except Exception:  # pragma: no cover
     filters = None
 
 from .agent import OSAgent
-from .config import get_telegram_chat_ids, get_telegram_token
+from .config import get_parent_email, get_telegram_chat_ids, get_telegram_token
 
 logger = logging.getLogger("ayman_os_agent.telegram_bot")
+
+
+def start_health_server() -> None:
+    """Run a minimal HTTP health check server if PORT is assigned by a cloud host."""
+    port_str = os.environ.get("PORT")
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+    except ValueError:
+        return
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","bot":"running"}\n')
+
+        def log_message(self, format, *args):
+            pass
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info("Health check server listening on port %d", port)
+    except Exception as exc:
+        logger.warning("Failed to start health check server on port %d: %s", port, exc)
 
 
 class TelegramBotService:
@@ -66,9 +99,17 @@ class TelegramBotService:
             return
         await self._reply(
             update,
-            "مرحباً! أنا وكيلي الشخصي.\n"
-            "الأوامر: /status /list /report /sheet /risk /summary /ai /appt "
-            "\nأو أرسل سؤالاً بسيطاً وسوف أحاول تنفيذه.",
+            "مرحباً بك! أنا Ayman OS Agent، مرشدك الدراسي الذكي.\n\n"
+            "📌 الأوامر المتاحة:\n"
+            "/summary - ملخص دراسة اليوم والتوصيات\n"
+            "/risk - تقييم المخاطر والمواد ذات الأولوية\n"
+            "/sheet - عرض ملخص جدول المذاكرة من Google Sheets\n"
+            "/report - عرض تقرير المتابعة\n"
+            "/sendreport - إرسال التقرير اليومي للوالد بالبريد\n"
+            "/appt - عرض أو إضافة المواعيد\n"
+            "/ai - التحدث مع المساعد الذكي\n"
+            "/status - حالة النظام\n\n"
+            "أو أرسل أي سؤال وسأقوم بالإجابة عليه مباشرة!",
         )
 
     async def status(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -89,6 +130,21 @@ class TelegramBotService:
             await self._handle_unauthorized(update)
             return
         await self._reply(update, self.agent.parent_report())
+
+    async def sendreport(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if not self._is_allowed(update):
+            await self._handle_unauthorized(update)
+            return
+        await self._reply(update, "⏳ جاري إرسال التقرير اليومي...")
+        report = self.agent.parent_report()
+        parent_email = get_parent_email()
+        results = []
+        if parent_email:
+            email_status = self.agent.send_alert(parent_email, "تقرير يومي من Ayman OS Agent", report)
+            results.append(email_status)
+        else:
+            results.append("لم يتم ضبط PARENT_EMAIL لإرسال التقرير بالبريد.")
+        await self._reply(update, "\n".join(results))
 
     async def sheet(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if not self._is_allowed(update):
@@ -138,8 +194,15 @@ class TelegramBotService:
         if not self._is_allowed(update):
             await self._handle_unauthorized(update)
             return
-        if not context.args:
-            await self._reply(update, "استخدم: /appt مراجعة 2026-09-17 09:00")
+        if not context.args or context.args[0].lower() in {"list", "show", "عرض", "مواعيد"}:
+            appointments = self.agent.list_appointments()
+            await self._reply(
+                update,
+                f"📅 قائمة المواعيد:\n{appointments}\n\nلإضافة موعد جديد: /appt عنوان التاريخ الوقت\nمثال: /appt مراجعة 2026-09-17 09:00",
+            )
+            return
+        if len(context.args) < 2:
+            await self._reply(update, "صيغة غير مكتملة. مثال: /appt مراجعة 2026-09-17 09:00\nأو لعرض المواعيد: /appt list")
             return
         try:
             title = context.args[0]
@@ -158,14 +221,33 @@ class TelegramBotService:
             except Exception:
                 pass
 
+    async def _post_init(self, app) -> None:
+        if BotCommand is not None:
+            commands = [
+                BotCommand("start", "بدء المحادثة والترحيب"),
+                BotCommand("summary", "ملخص دراسة اليوم والتوصيات"),
+                BotCommand("risk", "المواد ذات الأولوية والمخاطرة العالية"),
+                BotCommand("sheet", "قراءة بيانات ورقة ومتابعة المذاكرة"),
+                BotCommand("report", "عرض التقرير اليومي"),
+                BotCommand("sendreport", "إرسال التقرير اليومي للوالد"),
+                BotCommand("appt", "عرض أو إضافة المواعيد"),
+                BotCommand("ai", "سؤال المساعد الذكي (Gemini/Bedrock)"),
+                BotCommand("status", "حالة النظام والملفات"),
+            ]
+            try:
+                await app.bot.set_my_commands(commands)
+            except Exception as exc:
+                logger.warning("Could not register bot commands: %s", exc)
+
     def build_app(self):
         if not self.is_available():
             raise RuntimeError("Telegram bot is not configured. Set TELEGRAM_BOT_TOKEN.")
-        app = ApplicationBuilder().token(self.token).build()
+        app = ApplicationBuilder().token(self.token).post_init(self._post_init).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(CommandHandler("list", self.list))
         app.add_handler(CommandHandler("report", self.report))
+        app.add_handler(CommandHandler("sendreport", self.sendreport))
         app.add_handler(CommandHandler("sheet", self.sheet))
         app.add_handler(CommandHandler("risk", self.risk))
         app.add_handler(CommandHandler("summary", self.summary))
@@ -176,6 +258,7 @@ class TelegramBotService:
         return app
 
     def run(self) -> None:
+        start_health_server()
         app = self.build_app()
         logger.info("Telegram bot started polling...")
         app.run_polling()

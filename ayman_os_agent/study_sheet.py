@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -34,6 +35,9 @@ class StudySheetManager:
         remote_url = get_study_sheet_url()
         if remote_url:
             remote_path = get_data_dir() / "study-sheet.xlsx"
+            # If cached recently (within 10 minutes), avoid redundant network downloads
+            if remote_path.exists() and (time.time() - remote_path.stat().st_mtime < 600):
+                return remote_path
             try:
                 self._download_remote_workbook(remote_url, remote_path)
                 return remote_path
