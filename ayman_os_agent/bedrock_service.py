@@ -24,6 +24,7 @@ class BedrockService:
             os.environ.get(name)
             for name in (
                 "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
                 "AWS_PROFILE",
                 "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
@@ -34,6 +35,8 @@ class BedrockService:
             self.client = boto3.client("bedrock-runtime", region_name=self.config["region"])
 
     def is_available(self) -> bool:
+        self.gemini_config = get_gemini_config()
+        self.backend = get_ai_backend()
         if self.backend == "gemini":
             return bool(self.gemini_config["api_key"])
         if self.backend == "bedrock":
@@ -41,6 +44,8 @@ class BedrockService:
         return self.client is not None or bool(self.gemini_config["api_key"])
 
     def generate(self, prompt: str, system_prompt: str | None = None) -> str:
+        self.gemini_config = get_gemini_config()
+        self.backend = get_ai_backend()
         if self.backend in {"auto", "bedrock"} and self.client is not None:
             return self._generate_bedrock(prompt, system_prompt)
 
@@ -80,12 +85,16 @@ class BedrockService:
         if not api_key:
             return "Gemini API key is not configured."
 
+        model = self.gemini_config.get("model") or "gemini-3.6-flash"
+        if model.startswith("models/"):
+            model = model[len("models/") :]
+
         payload = {
             "contents": [{"parts": [{"text": (system_prompt + "\n\n" if system_prompt else "") + prompt}]}],
             "generationConfig": {"temperature": 0.4, "maxOutputTokens": 800},
         }
         url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_config['model']}:generateContent?key={api_key}"
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         )
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")

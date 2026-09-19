@@ -73,11 +73,21 @@ class OSAgent:
 
     def status_summary(self) -> str:
         items = self.list_directory(self.working_dir)
+        ai_available = self.bedrock.is_available()
+        gemini_cfg = self.bedrock.gemini_config
+        ai_status = (
+            f"✅ متصل ({self.bedrock.backend} - {gemini_cfg.get('model', 'gemini-3.6-flash')})"
+            if ai_available
+            else "❌ غير مضبوط (أرسل /setkey <المفتاح> أو اضبط GEMINI_API_KEY في لوحة Railway)"
+        )
+        sheet_status = "✅ متوفرة" if self.study_sheet.is_available() else "⚠️ غير متوفرة"
         return (
-            "حالة الوكيل\n"
-            f"الدليل الحالي: {self.working_dir}\n"
-            "المحتويات:\n"
-            f"{items[:1200]}"
+            "📊 حالة النظام والوكيل:\n"
+            f"• الذكاء الاصطناعي: {ai_status}\n"
+            f"• ورقة المتابعة: {sheet_status}\n"
+            f"• الدليل الحالي: {self.working_dir}\n\n"
+            "📁 المحتويات:\n"
+            f"{items[:1000]}"
         )
 
     def parent_report(self) -> str:
@@ -212,7 +222,10 @@ class OSAgent:
                 return "I need content to write. Example: write /tmp/demo.txt with hello world"
             return self.write_file(target, content)
 
-        if re.search(r"\b(run|execute|shell|command|تشغيل|أمر)\b", lowered):
+        if (
+            re.search(r"^(?:python3?|pytest|bash|sh|pip3?|npm|node|git)\s+", text.strip())
+            or re.search(r"\b(run|execute|shell|command|تشغيل|أمر)\b", lowered)
+        ):
             command = self._extract_command(text)
             return self.run_command(command)
 

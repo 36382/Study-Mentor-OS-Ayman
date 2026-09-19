@@ -59,9 +59,31 @@ def get_aws_config() -> dict:
 
 
 def get_gemini_config() -> dict:
+    model = _clean_str(os.environ.get("GEMINI_MODEL")) or "gemini-3.6-flash"
+    if model.startswith("models/"):
+        model = model[len("models/") :]
+    api_key = (
+        _clean_str(os.environ.get("GEMINI_API_KEY"))
+        or _clean_str(os.environ.get("GOOGLE_API_KEY"))
+        or _clean_str(os.environ.get("GEMINI_KEY"))
+    )
+    if not api_key:
+        settings_file = get_data_dir() / "settings.json"
+        if settings_file.is_file():
+            try:
+                import json
+
+                data = json.loads(settings_file.read_text(encoding="utf-8"))
+                api_key = data.get("GEMINI_API_KEY") or data.get("GOOGLE_API_KEY") or data.get("GEMINI_KEY")
+                if "GEMINI_MODEL" in data and data["GEMINI_MODEL"]:
+                    model = str(data["GEMINI_MODEL"]).strip()
+                    if model.startswith("models/"):
+                        model = model[len("models/") :]
+            except Exception:
+                pass
     return {
-        "api_key": _clean_str(os.environ.get("GEMINI_API_KEY")) or _clean_str(os.environ.get("GOOGLE_API_KEY")),
-        "model": _clean_str(os.environ.get("GEMINI_MODEL")) or "gemini-2.0-flash",
+        "api_key": api_key,
+        "model": model,
     }
 
 

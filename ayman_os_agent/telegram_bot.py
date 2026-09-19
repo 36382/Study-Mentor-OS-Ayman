@@ -108,6 +108,7 @@ class TelegramBotService:
             "/sendreport - إرسال التقرير اليومي للوالد بالبريد\n"
             "/appt - عرض أو إضافة المواعيد\n"
             "/ai - التحدث مع المساعد الذكي\n"
+            "/setkey - ضبط وتفعيل مفتاح Gemini مباشرة\n"
             "/status - حالة النظام\n\n"
             "أو أرسل أي سؤال وسأقوم بالإجابة عليه مباشرة!",
         )
@@ -213,6 +214,58 @@ class TelegramBotService:
         except Exception as exc:
             await self._reply(update, f"صيغة خاطئة. مثال: /appt مراجعة 2026-09-17 09:00\n({exc})")
 
+    async def setkey(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if not self._is_allowed(update):
+            await self._handle_unauthorized(update)
+            return
+        if not context.args:
+            await self._reply(
+                update,
+                "لضبط أو تحديث مفتاح Gemini، أرسل الأمر متبوعاً بالمفتاح:\n"
+                "`/setkey AIzaSy...`\n\n"
+                "أو يمكنك ضبط المتغير GEMINI_API_KEY في لوحة تحكم Railway.",
+            )
+            return
+        key = context.args[0].strip()
+        from .config import get_data_dir
+        import json
+
+        settings_file = get_data_dir() / "settings.json"
+        try:
+            data = {}
+            if settings_file.is_file():
+                try:
+                    data = json.loads(settings_file.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["GEMINI_API_KEY"] = key
+            data["GEMINI_MODEL"] = "gemini-3.6-flash"
+            settings_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.environ["GEMINI_API_KEY"] = key
+            os.environ["GEMINI_MODEL"] = "gemini-3.6-flash"
+
+            try:
+                if update.effective_message:
+                    await update.effective_message.delete()
+            except Exception:
+                pass
+
+            test_resp = self.agent.bedrock.generate("Say 'Gemini OK' in one word.")
+            if "Gemini API request failed" in test_resp or "No response" in test_resp or "failed" in test_resp.lower():
+                await self._reply(
+                    update,
+                    f"⚠️ تم حفظ المفتاح لكن فشل الاتصال مع Google Gemini:\n{test_resp}\n\nتأكد من صحة المفتاح.",
+                )
+            else:
+                await self._reply(
+                    update,
+                    "✅ تم تفعيل واختبار مفتاح Gemini بنجاح!\n"
+                    "🤖 الموديل النشط: gemini-3.6-flash 🚀\n\n"
+                    "يمكنك الآن التحدث مع البوت مباشرة وإرسال أي سؤال أو رابط.",
+                )
+        except Exception as exc:
+            await self._reply(update, f"حدث خطأ أثناء حفظ المفتاح: {exc}")
+
     async def _on_error(self, update: object, context: "ContextTypes.DEFAULT_TYPE") -> None:
         logger.error("Exception while handling an update: %s", context.error, exc_info=context.error)
         if isinstance(update, Update) and update.effective_message:
@@ -232,6 +285,7 @@ class TelegramBotService:
                 BotCommand("sendreport", "إرسال التقرير اليومي للوالد"),
                 BotCommand("appt", "عرض أو إضافة المواعيد"),
                 BotCommand("ai", "سؤال المساعد الذكي (Gemini/Bedrock)"),
+                BotCommand("setkey", "ضبط وتفعيل مفتاح Gemini مباشرة"),
                 BotCommand("status", "حالة النظام والملفات"),
             ]
             try:
@@ -253,6 +307,7 @@ class TelegramBotService:
         app.add_handler(CommandHandler("summary", self.summary))
         app.add_handler(CommandHandler("ai", self.ai))
         app.add_handler(CommandHandler("appt", self.appt))
+        app.add_handler(CommandHandler("setkey", self.setkey))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message))
         app.add_error_handler(self._on_error)
         return app

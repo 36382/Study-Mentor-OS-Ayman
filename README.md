@@ -134,7 +134,7 @@ export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="us-east-1"
 export AWS_BEDROCK_MODEL="anthropic.claude-3-haiku-20240307-v1:0"
 export GEMINI_API_KEY="..."
-export GEMINI_MODEL="gemini-2.0-flash"
+export GEMINI_MODEL="gemini-3.6-flash"
 ```
 
 ## Install as a package
