@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-from .config import get_study_sheet_path
+from .config import get_data_dir, get_study_sheet_path, get_study_sheet_url
 
 try:
     from openpyxl import load_workbook
@@ -16,6 +19,7 @@ class StudySheetManager:
     """Read the study tracking workbook used by the agent."""
 
     def __init__(self, workbook_path: str | None = None) -> None:
+        self.remote_error: str | None = None
         self.workbook_path = self._resolve_path(workbook_path)
 
     def _resolve_path(self, workbook_path: str | None) -> Path | None:
@@ -26,6 +30,23 @@ class StudySheetManager:
         explicit = get_study_sheet_path()
         if explicit:
             return Path(explicit).expanduser()
+
+        remote_url = get_study_sheet_url()
+        if remote_url:
+            remote_path = get_data_dir() / "study-sheet.xlsx"
+            try:
+                self._download_remote_workbook(remote_url, remote_path)
+                return remote_path
+            except HTTPError as exc:
+                self.remote_error = f"Google Sheet download failed with HTTP {exc.code}."
+                if remote_path.exists():
+                    return remote_path
+                return None
+            except URLError as exc:
+                self.remote_error = f"Google Sheet download failed: {exc.reason}."
+                if remote_path.exists():
+                    return remote_path
+                return None
 
         candidates: list[Path] = []
         for base_dir in (
@@ -50,6 +71,22 @@ class StudySheetManager:
             if candidate.exists():
                 return candidate
         return None
+
+    @staticmethod
+    def _download_remote_workbook(url: str, destination: Path) -> None:
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if "spreadsheets" not in parts or "d" not in parts:
+            raise ValueError("AYMAN_STUDY_SHEET_URL must be a Google Sheets URL.")
+        sheet_id = parts[parts.index("d") + 1]
+        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+        request = Request(export_url, headers={"User-Agent": "ayman-os-agent/0.2"})
+        with urlopen(request, timeout=30) as response:
+            content = response.read()
+        if not content.startswith(b"PK"):
+            raise ValueError("Google Sheet export did not return an XLSX workbook.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
 
     def is_available(self) -> bool:
         return bool(self.workbook_path and self.workbook_path.exists() and load_workbook is not None)
@@ -85,8 +122,10 @@ class StudySheetManager:
 
     def summary(self) -> str:
         if not self.is_available():
+            if self.remote_error:
+                return f"تعذر تحميل ورقة الدراسة من Google Sheets. {self.remote_error}"
             return (
-                "ملف ورقة الدراسة غير متوفر. ضع الملف في مجلد المشروع أو اضبط متغير البيئة "
+                "ملف ورقة الدراسة غير متوفر. اضبط AYMAN_STUDY_SHEET_URL أو "
                 "AYMAN_STUDY_SHEET أو STUDY_SHEET_PATH."
             )
 

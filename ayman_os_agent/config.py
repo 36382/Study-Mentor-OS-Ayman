@@ -45,6 +45,13 @@ def get_study_sheet_path() -> str | None:
     return os.environ.get("AYMAN_STUDY_SHEET") or os.environ.get("STUDY_SHEET_PATH") or None
 
 
+def get_study_sheet_url() -> str | None:
+    return os.environ.get(
+        "AYMAN_STUDY_SHEET_URL",
+        "https://docs.google.com/spreadsheets/d/1g7NsctkNigecJVVewBgdQeO9PXPceejg702MW60kQvY/edit",
+    ) or None
+
+
 def get_primary_report_label() -> str:
     return os.environ.get("REPORT_LABEL", "تقرير اليوم")
 

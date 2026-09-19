@@ -41,7 +41,7 @@ copy .env.example .env
 Then fill the values for:
 - `SMTP_USER`, `SMTP_PASSWORD`, `PARENT_EMAIL`
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (comma-separated IDs are supported)
-- `AYMAN_STUDY_SHEET` or `STUDY_SHEET_PATH` for the Excel workbook
+- `AYMAN_STUDY_SHEET`, `STUDY_SHEET_PATH`, or `AYMAN_STUDY_SHEET_URL` for the study data
 - `AI_BACKEND=auto`, `gemini`, or `bedrock`
 - `GEMINI_API_KEY` or AWS Bedrock credentials
 
@@ -74,6 +74,9 @@ SMTP_PASSWORD=your_app_password
 SMTP_FROM_EMAIL=your_gmail@gmail.com
 GEMINI_API_KEY=your_gemini_key
 ```
+
+The default Google Sheet URL is the configured public Study Mentor sheet. Railway
+downloads it as an XLSX workbook at startup; no Google credentials are required.
 
 ## Telegram bot
 
