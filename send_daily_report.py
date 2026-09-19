@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 from ayman_os_agent.agent import OSAgent
-from ayman_os_agent.config import get_parent_email, get_telegram_chat_ids
+from ayman_os_agent.config import get_parent_email, get_telegram_chat_ids, get_telegram_token
 from ayman_os_agent.notifications import AlertManager
 
 
@@ -22,7 +22,7 @@ def main() -> int:
         print(status)
 
     chat_ids = get_telegram_chat_ids()
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = get_telegram_token()
     if token and chat_ids:
         notifier = AlertManager()
         for chat_id in chat_ids:

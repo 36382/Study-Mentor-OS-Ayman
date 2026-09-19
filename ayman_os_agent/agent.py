@@ -108,6 +108,9 @@ class OSAgent:
         if workbook is None:
             return "تعذر قراءة ورقة الدراسة للـ risk summary."
 
+        if "Courses" not in workbook.sheetnames:
+            return "لا توجد ورقة باسم Courses في ملف الدراسة."
+
         rows = list(workbook["Courses"].iter_rows(values_only=True))
         if not rows:
             return "لا توجد بيانات في Course sheet."
@@ -213,9 +216,16 @@ class OSAgent:
             command = self._extract_command(text)
             return self.run_command(command)
 
+        if self.bedrock.is_available():
+            system_prompt = (
+                "أنت Ayman OS Agent، مساعد شخصي ومرشد دراسي ذكي. "
+                "أجب بصياغة عملية ومفيدة وموجزة."
+            )
+            return self.bedrock.generate(text, system_prompt)
+
         return (
             "أستطيع أن أساعدك في: عرض الملفات، قراءة الملفات، كتابة الملفات، تشغيل الأوامر، "
-            "إدارة المواعيد، إعداد التقارير، إرسال التنبيهات، والتفاعل مع AWS Bedrock.\n"
+            "إدارة المواعيد، إعداد التقارير، إرسال التنبيهات، والتفاعل مع AWS Bedrock و Gemini.\n"
             "أمثلة:\n"
             "- list current directory\n"
             "- read README.md\n"
