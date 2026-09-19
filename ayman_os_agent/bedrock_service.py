@@ -57,7 +57,7 @@ class BedrockService:
         try:
             body = {
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 800,
+                "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}],
             }
             if system_prompt:
@@ -82,7 +82,7 @@ class BedrockService:
 
         payload = {
             "contents": [{"parts": [{"text": (system_prompt + "\n\n" if system_prompt else "") + prompt}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 800},
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
         }
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_config['model']}:generateContent?key={api_key}"

@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover
     filters = None
 
 from .agent import OSAgent
-from .config import get_parent_email, get_telegram_chat_ids, get_telegram_token
+from .config import get_parent_email, get_telegram_chat_ids, get_telegram_max_response_chars, get_telegram_token
 
 logger = logging.getLogger("ayman_os_agent.telegram_bot")
 
@@ -59,6 +59,7 @@ class TelegramBotService:
     def __init__(self) -> None:
         self.token = get_telegram_token()
         self.allowed_chat_ids = get_telegram_chat_ids()
+        self.max_response_chars = get_telegram_max_response_chars()
         self.agent = OSAgent()
 
     def is_available(self) -> bool:
@@ -90,14 +91,12 @@ class TelegramBotService:
     async def _reply(self, update: "Update", text: str) -> None:
         target = update.effective_message or update.message
         if target is not None:
-            text = (text or "").strip()
+            text = "\n".join(" ".join(line.split()) for line in (text or "").splitlines() if line.strip())
             if not text:
                 text = "لا توجد استجابة."
-            if len(text) <= 4000:
-                await target.reply_text(text)
-            else:
-                for i in range(0, len(text), 4000):
-                    await target.reply_text(text[i : i + 4000])
+            if len(text) > self.max_response_chars:
+                text = text[: self.max_response_chars - 24].rsplit(" ", 1)[0] + "\n… (تم اختصار الرد)"
+            await target.reply_text(text)
 
     async def start(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if not self._is_allowed(update):
@@ -106,16 +105,8 @@ class TelegramBotService:
         await self._reply(
             update,
             "مرحباً بك! أنا Ayman OS Agent، مرشدك الدراسي الذكي.\n\n"
-            "📌 الأوامر المتاحة:\n"
-            "/summary - ملخص دراسة اليوم والتوصيات\n"
-            "/risk - تقييم المخاطر والمواد ذات الأولوية\n"
-            "/sheet - عرض ملخص جدول المذاكرة من Google Sheets\n"
-            "/report - عرض تقرير المتابعة\n"
-            "/sendreport - إرسال التقرير اليومي للوالد بالبريد\n"
-            "/appt - عرض أو إضافة المواعيد\n"
-            "/ai - التحدث مع المساعد الذكي\n"
-            "/status - حالة النظام\n\n"
-            "أو أرسل أي سؤال وسأقوم بالإجابة عليه مباشرة!",
+            "الأوامر: /summary /risk /sheet /report /appt /ai /status\n"
+            "أرسل سؤالك مباشرة وسأجيب باختصار.",
         )
 
     async def status(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -180,7 +171,10 @@ class TelegramBotService:
             return
         await self._reply(
             update,
-            self.agent.bedrock.generate(prompt, "أنت مساعد دراسي عملي. أجب بالعربية باختصار."),
+            self.agent.bedrock.generate(
+                prompt,
+                "أنت مساعد دراسي عملي. أجب بالعربية باختصار شديد: 3 نقاط كحد أقصى، ولا تكرر السؤال.",
+            ),
         )
 
     async def message(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:

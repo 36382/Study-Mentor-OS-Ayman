@@ -84,6 +84,13 @@ def get_telegram_chat_ids() -> tuple[str, ...]:
     return tuple(ids)
 
 
+def get_telegram_max_response_chars() -> int:
+    try:
+        return max(500, int(_clean_str(os.environ.get("TELEGRAM_MAX_RESPONSE_CHARS")) or "1800"))
+    except ValueError:
+        return 1800
+
+
 def get_parent_email() -> str | None:
     return _clean_str(os.environ.get("PARENT_EMAIL"))
 
@@ -117,4 +124,3 @@ def get_smtp_config() -> dict:
         "password": _clean_str(os.environ.get("SMTP_PASSWORD")),
         "from_email": from_email,
     }
-
