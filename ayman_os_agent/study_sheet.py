@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -34,6 +35,9 @@ class StudySheetManager:
         remote_url = get_study_sheet_url()
         if remote_url:
             remote_path = get_data_dir() / "study-sheet.xlsx"
+            # If cached recently (within 10 minutes), avoid redundant network downloads
+            if remote_path.exists() and (time.time() - remote_path.stat().st_mtime < 600):
+                return remote_path
             try:
                 self._download_remote_workbook(remote_url, remote_path)
                 return remote_path
@@ -44,6 +48,11 @@ class StudySheetManager:
                 return None
             except URLError as exc:
                 self.remote_error = f"Google Sheet download failed: {exc.reason}."
+                if remote_path.exists():
+                    return remote_path
+                return None
+            except Exception as exc:
+                self.remote_error = f"Google Sheet download failed: {exc}."
                 if remote_path.exists():
                     return remote_path
                 return None
@@ -134,6 +143,8 @@ class StudySheetManager:
             return "تعذر فتح ملف ورقة الدراسة. تأكد من أن الملف Excel صالح." 
 
         def get_sheet_rows(name: str) -> list[tuple[Any, ...]]:
+            if name not in workbook.sheetnames:
+                return []
             sheet = workbook[name]
             rows = list(sheet.iter_rows(values_only=True))
             return [tuple(self._normalize_value(cell) for cell in row) for row in rows if any(cell is not None and str(cell).strip() for cell in row)]

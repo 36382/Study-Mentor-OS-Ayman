@@ -80,16 +80,24 @@ downloads it as an XLSX workbook at startup; no Google credentials are required.
 
 ## Telegram bot
 
-Set the token and then start the bot. `TELEGRAM_CHAT_ID` is optional but recommended to
-restrict the bot to one Telegram chat:
+Set the token in `.env` and start the bot:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your-token"
 python -m ayman_os_agent.telegram_bot
 ```
 
-The bot supports `/sheet`, `/risk`, `/summary`, `/report`, `/ai your question`,
-and ordinary text messages.
+The bot features:
+- Interactive command menu (shows automatically when typing `/`)
+- `/summary` — ملخص دراسة اليوم والتوصيات
+- `/risk` — المواد الأكثر خطورة وأولوية
+- `/sheet` — قراءة ملخص بيانات ورقة الدراسة
+- `/report` — عرض تقرير المتابعة
+- `/sendreport` — إرسال التقرير اليومي للوالد بالبريد
+- `/appt` — عرض المواعيد أو إضافتها (`/appt list` أو `/appt مراجعة 2026-09-17 09:00`)
+- `/ai` — التحدث مع الذكاء الاصطناعي (Gemini أو Bedrock)
+- `/status` — عرض حالة النظام والملفات
+- Free-form conversation: أي سؤال أو رسالة يتم الإجابة عليها تلقائياً.
+- Built-in HTTP health check for cloud deployments (Railway/Render) on `$PORT`.
 
 ## Daily report sender
 
