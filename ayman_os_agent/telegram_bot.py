@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+_telegram_import_error: Exception | None = None
+
 try:
     from telegram import Update
     from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-except Exception:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover
+    _telegram_import_error = exc
     Update = None
     ApplicationBuilder = None
     CommandHandler = None
@@ -27,7 +33,10 @@ class TelegramBotService:
     def _is_allowed(self, update: "Update") -> bool:
         if not self.allowed_chat_ids or update.effective_chat is None:
             return True
-        return str(update.effective_chat.id) in self.allowed_chat_ids
+        allowed = str(update.effective_chat.id) in self.allowed_chat_ids
+        if not allowed:
+            logger.warning("Ignoring message from unauthorized Telegram chat ID %s.", update.effective_chat.id)
+        return allowed
 
     async def _reply(self, update: "Update", text: str) -> None:
         if update.message is not None:
@@ -97,7 +106,11 @@ class TelegramBotService:
 
     def build_app(self):
         if not self.is_available():
-            raise RuntimeError("Telegram bot is not configured. Set TELEGRAM_BOT_TOKEN.")
+            if not self.token:
+                raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
+            if _telegram_import_error is not None:
+                raise RuntimeError("python-telegram-bot is unavailable.") from _telegram_import_error
+            raise RuntimeError("Telegram bot dependencies are unavailable.")
         app = ApplicationBuilder().token(self.token).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("status", self.status))
@@ -117,8 +130,11 @@ class TelegramBotService:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     service = TelegramBotService()
     if not service.is_available():
-        print("Telegram bot is not configured. Set TELEGRAM_BOT_TOKEN before starting it.")
-        return
+        service.build_app()
     service.run()
