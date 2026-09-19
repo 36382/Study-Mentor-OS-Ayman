@@ -47,6 +47,11 @@ class StudySheetManager:
                 if remote_path.exists():
                     return remote_path
                 return None
+            except Exception as exc:
+                self.remote_error = f"Google Sheet download failed: {exc}."
+                if remote_path.exists():
+                    return remote_path
+                return None
 
         candidates: list[Path] = []
         for base_dir in (
@@ -134,6 +139,8 @@ class StudySheetManager:
             return "تعذر فتح ملف ورقة الدراسة. تأكد من أن الملف Excel صالح." 
 
         def get_sheet_rows(name: str) -> list[tuple[Any, ...]]:
+            if name not in workbook.sheetnames:
+                return []
             sheet = workbook[name]
             rows = list(sheet.iter_rows(values_only=True))
             return [tuple(self._normalize_value(cell) for cell in row) for row in rows if any(cell is not None and str(cell).strip() for cell in row)]
