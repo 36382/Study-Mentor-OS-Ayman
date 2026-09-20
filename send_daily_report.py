@@ -1,34 +1,27 @@
-from __future__ import annotations
+"""Send the daily parent report now: Telegram to all allowed chats (+ optional email)."""
 
-import os
-from datetime import datetime
+from __future__ import annotations
 
 from ayman_os_agent.agent import OSAgent
 from ayman_os_agent.config import get_parent_email, get_telegram_chat_ids, get_telegram_token
-from ayman_os_agent.notifications import AlertManager
 
 
 def main() -> int:
     agent = OSAgent()
     report = agent.parent_report()
-    parent_email = get_parent_email()
 
-    if parent_email:
-        status = agent.send_alert(
-            parent_email,
-            "تقرير يومي من Ayman OS Agent",
-            report,
-        )
-        print(status)
-
-    chat_ids = get_telegram_chat_ids()
     token = get_telegram_token()
+    chat_ids = get_telegram_chat_ids()
     if token and chat_ids:
-        notifier = AlertManager()
         for chat_id in chat_ids:
-            print(notifier.send_telegram_message(report, chat_id))
+            print(agent.alert_manager.send_telegram_message(report, chat_id))
+    else:
+        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID غير مضبوطين — تخطي إرسال تيليجرام.")
 
-    print(f"Report generated at {datetime.now().isoformat()}")
+    parent_email = get_parent_email()
+    if parent_email:
+        print(agent.alert_manager.send_email(parent_email, "تقرير يومي من Study Mentor OS", report))
+
     return 0
 
 

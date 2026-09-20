@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import smtplib
 from email.mime.text import MIMEText
-from urllib import request, error
+from urllib import error, request
 
 from .config import get_smtp_config, get_telegram_chat_ids, get_telegram_token
 

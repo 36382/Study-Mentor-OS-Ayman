@@ -1,151 +1,117 @@
-# ayman-os-agent
+# Study Mentor OS — Ayman 📚🤖
 
-A smart local operating-system agent built in Python. It can list directories, read and write files, run shell commands, manage appointments, build parent reports, send alerts, and integrate with AWS Bedrock and Telegram.
+وكيل مرشد دراسي ذكي: **بوت تيليجرام** للطالب والوالد، يستخدم **Google Sheets كقاعدة بيانات** (قراءة + كتابة)،
+بذكاء اصطناعي عبر **AWS Bedrock + Gemini** (Function Calling)، وتقارير وتذكيرات تلقائية بتوقيت **Asia/Riyadh**.
 
-## Features
-- List files and directories
-- Read and write files
-- Run shell commands
-- Manage appointments and calendar items
-- Generate parent-facing daily reports
-- Read and summarize the Study Mentor OS workbook
-- Send email alerts
-- Connect to AWS Bedrock for AI suggestions
-- Start a Telegram bot listener
-- Interactive REPL mode
+## المعمارية
 
-## Quick start
-
-```bash
-python main.py --help
-python main.py --interactive
-python main.py "list current directory"
-python main.py --read README.md
-python main.py --run "python --version"
-python main.py "add appointment review on 2026-09-17 at 09:00"
-python main.py "report"
-python main.py "show study sheet"
-python main.py "today summary"
-python main.py "check risk"
-python main.py "ask bedrock how to organize my day"
+```
+GitHub ──CI (pytest + ruff)──▶ Railway (Dockerfile)
+                                  │
+                  بوت تيليجرام (polling) + APScheduler داخلي
+                  │                        │
+          أدوات آمنة whitelisted       تقرير يومي 21:00
+          (Function Calling)           تذكير قبل المواعيد
+                  │                    نudge مسائي 20:00
+                  ▼
+      Google Sheets  ← قراءة + كتابة (gspread + Service Account)
+      │ Config │ Courses │ DailyLog │ SessionLog │ Schedule │ Tasks │ Appointments │ Alerts │
+                  │
+      تيليجرام: الطالب + الوالد (تقرير بريدي اختياري)
 ```
 
-## Secrets and environment
+**مبادئ أمنية:** لا تنفيذ shell، لا قراءة/كتابة ملفات، لا أسرار في الريبو،
+default-deny للتيليجرام (من ليس في `TELEGRAM_CHAT_ID` يُرفض).
 
-Do not place real secrets in the repository. Use a local `.env` file or OS environment variables. The project includes a sample template at `.env.example`.
+## النشر على Railway
 
-```bash
-copy .env.example .env
-```
+1. ارفع الريبو إلى GitHub واتصله بـ Railway (يستخدم `Dockerfile` تلقائياً).
+2. أضف متغيرات البيئة (انظر `.env.example`):
 
-Then fill the values for:
-- `SMTP_USER`, `SMTP_PASSWORD`, `PARENT_EMAIL`
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (comma-separated IDs are supported)
-- `AYMAN_STUDY_SHEET`, `STUDY_SHEET_PATH`, or `AYMAN_STUDY_SHEET_URL` for the study data
-- `AI_BACKEND=auto`, `gemini`, or `bedrock`
-- `GEMINI_API_KEY` or AWS Bedrock credentials
+| المتغير | مطلوب | الوصف |
+|---------|-------|-------|
+| `TELEGRAM_BOT_TOKEN` | ✅ | توكن البوت من BotFather |
+| `TELEGRAM_CHAT_ID` | ✅ | IDs مسموحة مفصولة بفواصل — **فارغة = رفض الجميع** |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | ✅ للكتابة | محتوى ملف Service Account JSON (أو Base64) |
+| `GOOGLE_SHEET_ID` | ✅ للكتابة | معرف الشيت من رابطه |
+| `TIMEZONE` | — | افتراضي `Asia/Riyadh` |
+| `DAILY_REPORT_TIME` | — | افتراضي `21:00` |
+| `EVENING_NUDGE_TIME` | — | افتراضي `20:00` |
+| `REMINDER_MINUTES_BEFORE` | — | افتراضي `60` |
+| `TELEGRAM_STUDENT_CHAT_ID` | — | نudge المساء للطالب فقط بدلاً من الجميع |
+| `AI_BACKEND` | — | `auto` (افتراضي) / `gemini` / `bedrock` |
+| `GEMINI_API_KEY` أو `AWS_*` | ✅ للذكاء | مفتاح Gemini أو مفاتيح Bedrock |
+| `PARENT_EMAIL` + `SMTP_*` | — | تقرير بريدي اختياري |
 
-## Railway deployment
+3. انشر — لا حاجة لأي إعداد آخر. فحص الصحة يخدم تلقائياً على `$PORT`.
 
-This repo is ready to deploy to Railway using either Docker or the Railway app config.
+## إعداد Google Sheets (مرة واحدة)
 
-Files included:
-- `Dockerfile`
-- `railway.json`
-- `Procfile`
+1. أنشئ **Service Account** في Google Cloud وفعّل Sheets + Drive API
+   (الخطوات التفصيلية في `docs/UPGRADE_PLAN.md` القسم 4).
+2. شارك الشيت مع بريد الـ SA بصلاحية **Editor**، **ثم اجعل الشيت Restricted**.
+3. ضع محتوى مفتاح JSON في `GOOGLE_SERVICE_ACCOUNT_JSON` ومعرف الشيت في `GOOGLE_SHEET_ID`.
 
-To deploy:
-1. Push this repository to GitHub.
-2. Open Railway and create a new project from GitHub.
-3. Select this repo.
-4. Set the environment variables from `.env.example` in the Railway dashboard.
-5. Deploy.
+التابات المتوقعة: `Config`, `Courses`, `DailyLog`, `Schedule`, `Alerts` (موجودة لديك)،
+ويُنشئ الوكيل تلقائياً: `Tasks`, `Appointments`, `SessionLog` عند أول استخدام.
 
-Example environment variables for Railway:
+بدون Service Account يعمل البوت بوضع **قراءة فقط** (عبر `AYMAN_STUDY_SHEET_URL` أو `AYMAN_STUDY_SHEET` محلياً).
 
-```bash
-TELEGRAM_BOT_TOKEN=your_token_here
-TELEGRAM_CHAT_ID=8778090214,7398495644
-PARENT_EMAIL=parent@example.com
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your_gmail@gmail.com
-SMTP_PASSWORD=your_app_password
-SMTP_FROM_EMAIL=your_gmail@gmail.com
-GEMINI_API_KEY=your_gemini_key
-```
+## أوامر تيليجرام
 
-The default Google Sheet URL is the configured public Study Mentor sheet. Railway
-downloads it as an XLSX workbook at startup; no Google credentials are required.
+| الأمر | الوظيفة |
+|-------|---------|
+| `/summary` | ملخص اليوم (دقائق المسجلة، آخر سجل، توصية) |
+| `/risk` | المادة الأعلى مخاطرة وترتيب المواد |
+| `/log CS120 45 [ملاحظة]` | تسجيل جلسة مذاكرة في الشيت |
+| `/tasks` و `/done واجب` | عرض المهام المفتوحة / إنجاز مهمة |
+| `/appt` و `/appt عنوان \| 2026-09-25 \| 18:00` | المواعيد: عرض / إضافة |
+| `/report` و `/sendreport` | معاينة تقرير الوالد / إرساله الآن |
+| `/ai سؤالك` | سؤال المرشد الذكي |
+| `/status` | حالة النظام والمجدول وآخر مزامنة |
 
-## Telegram bot
+**والرسائل الحرة:** اكتب بشكل طبيعي («ذاكرت ساعة ونص على CS120»، «أضف موعد مراجعة بكرة 6») —
+الوكيل يفهم ويستخدم الأدوات آلياً (log_study, add_appointment, …) ثم يؤكد لك.
 
-Set the token in `.env` and start the bot:
-
-```bash
-python -m ayman_os_agent.telegram_bot
-```
-
-The bot features:
-- Interactive command menu (shows automatically when typing `/`)
-- `/summary` — ملخص دراسة اليوم والتوصيات
-- `/risk` — المواد الأكثر خطورة وأولوية
-- `/sheet` — قراءة ملخص بيانات ورقة الدراسة
-- `/report` — عرض تقرير المتابعة
-- `/sendreport` — إرسال التقرير اليومي للوالد بالبريد
-- `/appt` — عرض المواعيد أو إضافتها (`/appt list` أو `/appt مراجعة 2026-09-17 09:00`)
-- `/ai` — التحدث مع الذكاء الاصطناعي (Gemini أو Bedrock)
-- `/status` — عرض حالة النظام والملفات
-- Free-form conversation: أي سؤال أو رسالة يتم الإجابة عليها تلقائياً.
-- Built-in HTTP health check for cloud deployments (Railway/Render) on `$PORT`.
-
-## Daily report sender
-
-To generate and send a daily parent report automatically:
+## التشغيل المحلي
 
 ```bash
-python send_daily_report.py
-```
+pip install -r requirements.txt
+cp .env.example .env   # ثم املأ القيم
 
-## Daily study commands
-
-Useful commands for the workbook-backed study flow:
-
-```bash
-python -m ayman_os_agent.agent --sheet
-python -m ayman_os_agent.agent --risk
+python -m ayman_os_agent.agent --status
 python -m ayman_os_agent.agent --summary
-python -m ayman_os_agent.agent "today summary"
-python -m ayman_os_agent.agent "check risk"
+python -m ayman_os_agent.agent "وش أخطر مادة؟"
+python -m ayman_os_agent.telegram_bot     # البوت
+python send_daily_report.py               # التقرير الآن
 ```
 
-On Windows, you can also schedule it with Task Scheduler once you set `PARENT_EMAIL`, `SMTP_*`, and `TELEGRAM_*` environment variables.
+> ⚠️ لا تشغّل نسخة محلية والنسخة على Railway في نفس الوقت — يحدث تعارض
+> `409 Conflict` في تلقي التحديثات. نسخة واحدة فقط.
 
-## AWS Bedrock and Gemini
-
-Use `AI_BACKEND=gemini` for Gemini, `AI_BACKEND=bedrock` for Bedrock, or
-`AI_BACKEND=auto` to prefer Bedrock and fall back to Gemini.
-
-Set your credentials and optional model before using the AI features:
+## التطوير
 
 ```bash
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-export AWS_REGION="us-east-1"
-export AWS_BEDROCK_MODEL="anthropic.claude-3-haiku-20240307-v1:0"
-export GEMINI_API_KEY="..."
-export GEMINI_MODEL="gemini-2.0-flash"
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check .
+pytest
 ```
 
-## Install as a package
+CI (GitHub Actions) يشغّل `ruff` + `pytest` على كل push.
 
-```bash
-python -m pip install .
+## هيكل الكود
+
 ```
-
-Then run:
-
-```bash
-ayman-os-agent --help
-ayman-os-agent-bot
+ayman_os_agent/
+├── agent.py          # OSAgent: الأدوات الآمنة + حلقة Function Calling + التوجيه السريع
+├── ai_service.py     # Bedrock Converse + Gemini function calling (مخطط أدوات موحد)
+├── sheet_store.py    # طبقة Google Sheets: قراءة/كتابة + كاش TTL + Service Account
+├── study_sheet.py    # سجلات الشيت الدراسي (+ احتياطي XLSX للقراءة فقط)
+├── scheduler.py      # المواعيد (تاب Appointments + ترحيل من JSON القديم)
+├── tasks.py          # المهام (تاب Tasks)
+├── reporting.py      # تقرير الوالد اليومي
+├── notifications.py  # تيليجرام + بريد اختياري
+├── telegram_bot.py   # الواجهة: أوامر + رسائل حرة + APScheduler + default-deny
+├── timeutils.py      # كل منطق الوقت بتوقيت Asia/Riyadh
+└── config.py         # الإعدادات (بلا أسرار أو روابط حقيقية)
 ```

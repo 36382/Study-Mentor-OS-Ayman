@@ -1,7 +1,11 @@
+"""Study workbook access: Google Sheets (primary) or XLSX (read-only fallback).
+
+Exposes normalized records for the tabs: Config, Courses, DailyLog,
+SessionLog, Schedule, Alerts.
+"""
+
 from __future__ import annotations
 
-import os
-import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -9,6 +13,8 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .config import get_data_dir, get_study_sheet_path, get_study_sheet_url
+from .sheet_store import SheetStore
+from .timeutils import parse_date, today_iso
 
 try:
     from openpyxl import load_workbook
@@ -16,208 +22,245 @@ except Exception:  # pragma: no cover
     load_workbook = None
 
 
+def field(record: dict, *aliases: str, default: Any = "") -> Any:
+    """Fetch the first matching key from a record (case/space tolerant)."""
+    lookup = {str(k).strip().lower().replace(" ", "").replace("_", ""): k for k in record}
+    for alias in aliases:
+        key = lookup.get(alias.lower().replace(" ", "").replace("_", ""))
+        if key is not None and str(record[key]).strip():
+            return record[key]
+    return default
+
+
 class StudySheetManager:
-    """Read the study tracking workbook used by the agent."""
+    """Read the study tracking data used by the agent."""
 
-    def __init__(self, workbook_path: str | None = None) -> None:
+    def __init__(self, store: SheetStore | None = None, workbook_path: str | None = None) -> None:
+        self.store = store or SheetStore.from_env()
         self.remote_error: str | None = None
-        self.workbook_path = self._resolve_path(workbook_path)
+        self.workbook_path = self._resolve_xlsx_path(workbook_path)
 
-    def _resolve_path(self, workbook_path: str | None) -> Path | None:
+    # ------------------------------------------------------------ mode
+
+    def mode(self) -> str:
+        if self.store.is_writable():
+            return "sheets"
+        if self.workbook_path and self.workbook_path.exists() and load_workbook is not None:
+            return "xlsx"
+        if self.store.sheet_url:
+            candidate = get_data_dir() / "study-sheet.xlsx"
+            if candidate.exists() and load_workbook is not None:
+                return "xlsx"
+        return "none"
+
+    def is_available(self) -> bool:
+        return self.mode() in {"sheets", "xlsx"}
+
+    # ------------------------------------------------------------ xlsx fallback
+
+    def _resolve_xlsx_path(self, workbook_path: str | None):
         if workbook_path:
-            path = Path(workbook_path).expanduser()
-            return path if path.exists() else path
-
+            return Path(workbook_path).expanduser()
         explicit = get_study_sheet_path()
         if explicit:
             return Path(explicit).expanduser()
-
-        remote_url = get_study_sheet_url()
-        if remote_url:
-            remote_path = get_data_dir() / "study-sheet.xlsx"
-            # If cached recently (within 10 minutes), avoid redundant network downloads
-            if remote_path.exists() and (time.time() - remote_path.stat().st_mtime < 600):
-                return remote_path
+        url = get_study_sheet_url()
+        if url:
+            cached = get_data_dir() / "study-sheet.xlsx"
             try:
-                self._download_remote_workbook(remote_url, remote_path)
-                return remote_path
-            except HTTPError as exc:
-                self.remote_error = f"Google Sheet download failed with HTTP {exc.code}."
-                if remote_path.exists():
-                    return remote_path
-                return None
-            except URLError as exc:
-                self.remote_error = f"Google Sheet download failed: {exc.reason}."
-                if remote_path.exists():
-                    return remote_path
-                return None
-            except Exception as exc:
-                self.remote_error = f"Google Sheet download failed: {exc}."
-                if remote_path.exists():
-                    return remote_path
-                return None
-
-        candidates: list[Path] = []
-        for base_dir in (
-            Path.cwd(),
-            Path.cwd().parent,
-            Path.home(),
-            Path.home() / "OneDrive" / "Desktop",
-            Path.home() / "OneDrive" / "Desktop" / "aymn OS",
-        ):
-            if not base_dir.exists():
-                continue
-            candidates.extend(
-                [
-                    base_dir / "Study Mentor OS — Ayman.xlsx",
-                    base_dir / "Study Mentor OS - Ayman.xlsx",
-                    base_dir / "Study Mentor OS.xlsx",
-                ]
-            )
-            candidates.extend(sorted(base_dir.glob("*.xlsx")))
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
+                if not cached.exists() or cached.stat().st_size == 0:
+                    self._download_remote_workbook(url, cached)
+            except (HTTPError, URLError, ValueError, OSError) as exc:
+                self.remote_error = f"XLSX fallback download failed: {exc}"
+            return cached
         return None
 
     @staticmethod
-    def _download_remote_workbook(url: str, destination: Path) -> None:
+    def _download_remote_workbook(url: str, destination) -> None:
         parsed = urlparse(url)
         parts = [part for part in parsed.path.split("/") if part]
-        if "spreadsheets" not in parts or "d" not in parts:
-            raise ValueError("AYMAN_STUDY_SHEET_URL must be a Google Sheets URL.")
-        sheet_id = parts[parts.index("d") + 1]
-        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-        request = Request(export_url, headers={"User-Agent": "ayman-os-agent/0.2"})
+        if "spreadsheets" in parts and "d" in parts:
+            sheet_id = parts[parts.index("d") + 1]
+            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+        request = Request(url, headers={"User-Agent": "ayman-os-agent/0.3"})
         with urlopen(request, timeout=30) as response:
             content = response.read()
         if not content.startswith(b"PK"):
-            raise ValueError("Google Sheet export did not return an XLSX workbook.")
+            raise ValueError("Download did not return an XLSX workbook.")
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
 
-    def is_available(self) -> bool:
-        return bool(self.workbook_path and self.workbook_path.exists() and load_workbook is not None)
-
-    def load_workbook(self):
-        if not self.is_available():
+    def _load_xlsx(self):
+        if not self.workbook_path or load_workbook is None:
             return None
-        return load_workbook(self.workbook_path, data_only=True)
+        try:
+            if not self.workbook_path.exists():
+                return None
+            return load_workbook(self.workbook_path, data_only=True)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------ unified reads
 
     @staticmethod
-    def _normalize_value(value: Any) -> str:
+    def _normalize(value: Any) -> str:
         if value is None:
             return ""
         if hasattr(value, "isoformat") and not isinstance(value, str):
             return value.isoformat()
         return str(value).strip()
 
-    @staticmethod
-    def _rows_as_dicts(rows: list[tuple[Any, ...]]):
+    def _records(self, tab: str) -> list[dict]:
+        """Records from Google Sheets (cached) or the XLSX fallback."""
+        if self.store.is_writable():
+            return self.store.get_records(tab)
+        workbook = self._load_xlsx()
+        if workbook is None:
+            return []
+        if tab not in workbook.sheetnames:
+            return []
+        rows = list(workbook[tab].iter_rows(values_only=True))
         if not rows:
             return []
-        headers = [str(cell).strip() for cell in rows[0]]
-        entries = []
+        headers = [self._normalize(cell) for cell in rows[0]]
+        records = []
         for row in rows[1:]:
             if not any(cell is not None and str(cell).strip() for cell in row):
                 continue
-            mapping = {}
-            for idx, header in enumerate(headers):
-                value = row[idx] if idx < len(row) else ""
-                mapping[header] = StudySheetManager._normalize_value(value)
-            entries.append(mapping)
-        return entries
+            records.append(
+                {headers[i]: self._normalize(row[i] if i < len(row) else "") for i in range(len(headers))}
+            )
+        return records
+
+    def config_map(self) -> dict:
+        records = self._records("Config")
+        return {field(r, "key", "config", "name"): field(r, "value", "setting") for r in records if field(r, "key", "config", "name")}
+
+    def courses(self) -> list[dict]:
+        return self._records("Courses")
+
+    def schedule(self) -> list[dict]:
+        return self._records("Schedule")
+
+    def daily_logs(self) -> list[dict]:
+        return self._records("DailyLog")
+
+    def session_logs(self) -> list[dict]:
+        return self._records("SessionLog")
+
+    def alerts(self) -> list[dict]:
+        return self._records("Alerts")
+
+    def latest_daily(self) -> dict | None:
+        logs = self.daily_logs()
+        return logs[-1] if logs else None
+
+    # ------------------------------------------------------------ derived metrics
+
+    def minutes_logged_today(self) -> float:
+        """Minutes logged today: SessionLog sessions + DailyLog TotalMin (whichever larger)."""
+        today = today_iso()
+        sessions = 0.0
+        for record in self.session_logs():
+            if parse_date(field(record, "date", "day")) and parse_date(field(record, "date", "day")).isoformat() == today:
+                try:
+                    sessions += float(field(record, "minutes", "min", "duration", default=0) or 0)
+                except (TypeError, ValueError):
+                    continue
+        daily_total = 0.0
+        for record in self.daily_logs():
+            day = parse_date(field(record, "date", "day"))
+            if day and day.isoformat() == today:
+                try:
+                    daily_total = max(daily_total, float(field(record, "totalmin", "total_min", "minutes", default=0) or 0))
+                except (TypeError, ValueError):
+                    continue
+        return max(sessions, daily_total)
+
+    def high_risk_courses(self) -> list[dict]:
+        entries = []
+        for item in self.courses():
+            risk = str(field(item, "risk", default="")).upper()
+            if risk in {"HIGH", "MEDIUM"}:
+                try:
+                    priority = float(field(item, "priority", default=999))
+                except (TypeError, ValueError):
+                    priority = 999.0
+                entries.append((priority, item))
+        entries.sort(key=lambda pair: pair[0])
+        return [item for _, item in entries]
+
+    def top_risk_course(self) -> dict | None:
+        ranked = self.high_risk_courses()
+        if ranked:
+            return ranked[0]
+        courses = self.courses()
+        return courses[0] if courses else None
+
+    # ------------------------------------------------------------ summary text
 
     def summary(self) -> str:
         if not self.is_available():
             if self.remote_error:
-                return f"تعذر تحميل ورقة الدراسة من Google Sheets. {self.remote_error}"
+                return f"تعذر تحميل ورقة الدراسة. {self.remote_error}"
+            if self.store.last_error:
+                return f"تعذر الوصول إلى Google Sheets: {self.store.last_error}"
             return (
-                "ملف ورقة الدراسة غير متوفر. اضبط AYMAN_STUDY_SHEET_URL أو "
-                "AYMAN_STUDY_SHEET أو STUDY_SHEET_PATH."
+                "ورقة الدراسة غير متصلة. اضبط GOOGLE_SERVICE_ACCOUNT_JSON و GOOGLE_SHEET_ID "
+                "(قراءة + كتابة) أو AYMAN_STUDY_SHEET_URL / AYMAN_STUDY_SHEET (قراءة فقط)."
             )
 
-        workbook = self.load_workbook()
-        if workbook is None:
-            return "تعذر فتح ملف ورقة الدراسة. تأكد من أن الملف Excel صالح." 
-
-        def get_sheet_rows(name: str) -> list[tuple[Any, ...]]:
-            if name not in workbook.sheetnames:
-                return []
-            sheet = workbook[name]
-            rows = list(sheet.iter_rows(values_only=True))
-            return [tuple(self._normalize_value(cell) for cell in row) for row in rows if any(cell is not None and str(cell).strip() for cell in row)]
-
-        config_rows = get_sheet_rows("Config")
-        config_map = {}
-        if config_rows:
-            config_map = {row[0]: row[1] if len(row) > 1 else "" for row in config_rows[1:] if row and row[0]}
-
-        schedule_rows = get_sheet_rows("Schedule")
-        course_rows = get_sheet_rows("Courses")
-        daily_rows = get_sheet_rows("DailyLog")
-        alerts_rows = get_sheet_rows("Alerts")
-
-        schedule_preview = []
-        if len(schedule_rows) > 1:
-            for row in schedule_rows[1:6]:
-                if len(row) >= 6:
-                    schedule_preview.append(f"- {row[0]}: {row[3]} ({row[1]} - {row[2]})")
-
-        course_entries = self._rows_as_dicts(course_rows)
-        high_risk_courses = [
-            item for item in course_entries
-            if item.get("Risk", "").upper() in {"HIGH", "MEDIUM"}
-        ]
-        high_risk_courses.sort(key=lambda x: float(x.get("Priority", "999") or 999))
-
-        latest_daily = None
-        if daily_rows and len(daily_rows) > 1:
-            latest_daily = self._rows_as_dicts(daily_rows)[-1]
-
-        latest_alert = None
-        if alerts_rows and len(alerts_rows) > 1:
-            latest_alert = self._rows_as_dicts(alerts_rows)[-1]
-
+        config_map = self.config_map()
         lines = [
             "## ملخص ورقة الدراسة",
-            f"الملف: {self.workbook_path}",
-            f"اسم الطالب: {config_map.get('STUDENT_NAME', '-')}",
-            f"بريد الطالب: {config_map.get('STUDENT_EMAIL', '-')}",
-            f"بريد الوالد: {config_map.get('PARENT_EMAIL', '-')}",
+            f"المصدر: {'Google Sheets (مباشر)' if self.mode() == 'sheets' else self.workbook_path}",
+            f"اسم الطالب: {field(config_map, 'student_name', default='-')}",
             "",
             "### جدول اليوم والمواد",
         ]
 
-        if schedule_preview:
-            lines.extend(schedule_preview)
-        else:
-            lines.append("- لا توجد مواعيد مسجلة في الجدول.")
+        schedule_preview = []
+        for row in self.schedule()[:5]:
+            row_summary = " | ".join(str(v) for v in list(row.values())[:4] if str(v).strip())
+            if row_summary:
+                schedule_preview.append(f"- {row_summary}")
+        lines.extend(schedule_preview or ["- لا توجد مواعيد مسجلة في الجدول."])
 
         lines.extend(["", "### المواد ذات الأولوية العالية"])
-        if high_risk_courses:
-            for item in high_risk_courses[:5]:
-                risk = item.get("Risk", "UNKNOWN")
-                priority = item.get("Priority", "-")
-                target = item.get("WeeklyTargetMin", "-")
-                lines.append(f"- {item.get('Code', item.get('Key', '-'))}: {item.get('Name', '-')} | Risk={risk} | Priority={priority} | Target={target} min")
+        high_risk = self.high_risk_courses()
+        if high_risk:
+            for item in high_risk[:5]:
+                code = field(item, "code", "key", default="-")
+                name = field(item, "name", default="-")
+                risk = field(item, "risk", default="?")
+                priority = field(item, "priority", default="-")
+                target = field(item, "weeklytargetmin", "target", default="-")
+                lines.append(f"- {code}: {name} | Risk={risk} | Priority={priority} | Target={target} min")
         else:
             lines.append("- لا توجد مواد مطابقة.")
 
         lines.extend(["", "### آخر سجل يومي"])
-        if latest_daily:
+        latest = self.latest_daily()
+        if latest:
             lines.append(
-                f"- TotalMin={latest_daily.get('TotalMin', '-')}, Confidence={latest_daily.get('Confidence', '-')}, "
-                f"HardestCourse={latest_daily.get('HardestCourse', '-')}, NeedHelp={latest_daily.get('NeedHelp', '-')}"
+                f"- TotalMin={field(latest, 'totalmin', 'total_min', default='-')}, "
+                f"Confidence={field(latest, 'confidence', default='-')}, "
+                f"HardestCourse={field(latest, 'hardestcourse', 'hardest_course', default='-')}, "
+                f"NeedHelp={field(latest, 'needhelp', 'need_help', default='-')}"
             )
         else:
             lines.append("- لا يوجد سجل يومي حديث.")
 
         lines.extend(["", "### آخر تنبيه"])
-        if latest_alert:
-            lines.append(f"- {latest_alert.get('Severity', '-')} | {latest_alert.get('Type', '-')} | {latest_alert.get('Message', '-')}")
+        alert_rows = self.alerts()
+        if alert_rows:
+            latest_alert = alert_rows[-1]
+            lines.append(
+                f"- {field(latest_alert, 'severity', default='-')} | {field(latest_alert, 'type', default='-')} | "
+                f"{field(latest_alert, 'message', default='-')}"
+            )
         else:
             lines.append("- لا يوجد تنبيه مسجل.")
 
         return "\n".join(lines)
+

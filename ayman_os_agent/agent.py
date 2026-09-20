@@ -1,342 +1,367 @@
+"""OSAgent: the study-mentor brain.
+
+Security model:
+- NO shell execution, NO arbitrary file read/write, NO OS tooling.
+- The only writable destinations are the study Google Sheet (via SheetStore)
+  and the agent's own data dir (legacy appointments fallback).
+- Free-form messages go through the AI tool-use loop; every tool call is
+  validated against a strict whitelist in :meth:`execute_tool`.
+"""
+
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-from pathlib import Path
-from typing import Optional
+from collections import deque
 
-from .bedrock_service import BedrockService
+from .ai_service import TOOL_NAMES, AIService
+from .config import get_parent_email, get_telegram_chat_ids, get_telegram_token, get_timezone_name
 from .notifications import AlertManager
 from .reporting import ParentReportBuilder
 from .scheduler import AppointmentManager
-from .study_sheet import StudySheetManager
+from .sheet_store import SheetStore
+from .study_sheet import StudySheetManager, field
+from .tasks import TaskManager
+from .timeutils import now, parse_date, parse_time, today_iso
+
+SYSTEM_PROMPT = (
+    "أنت «المرشد الدراسي» في نظام Study Mentor OS. دورك: متابعة مذاكرة الطالب، تسجيل جلساته، "
+    "تنظيم مهامه ومواعيده، وتحفيزه باختصار.\n"
+    "قواعد:\n"
+    "- أجب بالعربية، بحد أقصى 6 أسطر، وبلا حشو أو تكرار للسؤال.\n"
+    "- استخدم الأدوات لجلب الحقائق أو تسجيل الأفعال؛ لا تخترع أرقاماً.\n"
+    "- عند ذكر الطالب أن ذاكر جلسة، سجّلها بأداة log_study مباشرة.\n"
+    "- التاريخ والوقت الحاليان سيُزوَّدان لك في هذه الرسالة؛ استخدمهما لحسم «اليوم/غداً».\n"
+    "- المواعيد والمهام تُحفظ في شيت الدراسة تلقائياً عند استخدام الأدوات."
+)
+
+
+def _clean_minutes(value: object) -> int | None:
+    try:
+        minutes = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    if minutes < 1 or minutes > 600:
+        return None
+    return minutes
+
+
+def _clean_code(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()[:20]
 
 
 class OSAgent:
-    """A proactive local OS agent with file, shell, AI, scheduling, and reporting tools."""
+    """Safe, sheet-backed study mentor agent."""
 
-    def __init__(self, working_dir: Optional[str] = None) -> None:
-        self.working_dir = Path(working_dir or os.getcwd()).resolve()
-        self.scheduler = AppointmentManager()
-        self.study_sheet = StudySheetManager()
-        self.report_builder = ParentReportBuilder(self.scheduler, self.study_sheet)
+    def __init__(self, store: SheetStore | None = None, data_dir=None) -> None:
+        self.store = store or SheetStore.from_env()
+        self.study_sheet = StudySheetManager(self.store)
+        self.scheduler = AppointmentManager(self.store)
+        self.tasks = TaskManager(self.store)
+        self.report_builder = ParentReportBuilder(self.scheduler, self.study_sheet, self.tasks)
         self.alert_manager = AlertManager()
-        self.bedrock = BedrockService()
+        self.ai = AIService()
+        self._sessions: dict[str, deque] = {}
 
-    def list_directory(self, path: Optional[str] = None) -> str:
-        target = self._resolve_path(path)
-        if not target.exists():
-            return f"Path does not exist: {target}"
-        if not target.is_dir():
-            return f"Not a directory: {target}"
+    # ================================================================ facts
 
-        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        lines = [f"{p.name}{'/' if p.is_dir() else ''}" for p in entries]
-        return "\n".join(lines) if lines else "(empty directory)"
+    def sheet_mode(self) -> str:
+        return self.study_sheet.mode()
 
-    def read_file(self, path: str) -> str:
-        target = self._resolve_path(path)
-        if not target.exists():
-            return f"File does not exist: {target}"
-        if target.is_dir():
-            return f"Path is a directory, not a file: {target}"
-        try:
-            return target.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return target.read_bytes().decode("utf-8", errors="replace")
-
-    def write_file(self, path: str, content: str) -> str:
-        target = self._resolve_path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return f"Written {len(content.encode('utf-8'))} bytes to {target}"
-
-    def run_command(self, command: str) -> str:
-        if not command.strip():
-            return "Empty command"
-        try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(self.working_dir),
-                capture_output=True,
-                text=True,
-                timeout=30,
+    def today_summary(self) -> str:
+        if not self.study_sheet.is_available():
+            return self.study_sheet.summary()
+        minutes = self.study_sheet.minutes_logged_today()
+        latest = self.study_sheet.latest_daily()
+        lines = [
+            "## ملخص اليوم",
+            f"التاريخ: {today_iso()} ({get_timezone_name()})",
+            f"دقائق مسجلة اليوم (جلسات البوت): {minutes:g}" if minutes else "لا توجد جلسات مسجلة اليوم بعد.",
+        ]
+        if latest:
+            lines.append(
+                f"آخر سجل يومي: TotalMin={field(latest, 'totalmin', 'total_min', default='-')}, "
+                f"Confidence={field(latest, 'confidence', default='-')}"
             )
-            output = completed.stdout.strip()
-            error = completed.stderr.strip()
-            combined = "\n".join(part for part in [output, error] if part)
-            return combined if combined else f"Command exited with status {completed.returncode}"
-        except subprocess.TimeoutExpired:
-            return "Command timed out after 30 seconds."
-
-    def status_summary(self) -> str:
-        items = self.list_directory(self.working_dir)
-        return (
-            "حالة الوكيل\n"
-            f"الدليل الحالي: {self.working_dir}\n"
-            "المحتويات:\n"
-            f"{items[:1200]}"
+        open_tasks = self.tasks.open_items()
+        if open_tasks:
+            lines.append(f"مهام مفتوحة: {len(open_tasks)} — استخدم /tasks لعرضها.")
+        lines.extend(
+            [
+                "",
+                "### توصية سريعة",
+                "- ابدأ بالمادة الأعلى مخاطرة (أمر /risk).",
+                "- سجّل كل جلسة فور انتهائها: /log CS120 45",
+            ]
         )
+        return "\n".join(lines)
 
-    def parent_report(self) -> str:
-        return self.report_builder.build("تقرير الوالد")
+    def risk_summary(self) -> str:
+        top = self.study_sheet.top_risk_course()
+        if top is None:
+            return self.study_sheet.summary()
+        ranked = self.study_sheet.high_risk_courses()
+        lines = [
+            "## تقييم المخاطرة",
+            f"أعلى مخاطرة الآن: {field(top, 'code', 'key', default='-')} - {field(top, 'name', default='-')}",
+            f"Risk={field(top, 'risk', default='-')} | Priority={field(top, 'priority', default='-')} "
+            f"| Target={field(top, 'weeklytargetmin', 'target', default='-')} min",
+        ]
+        if len(ranked) > 1:
+            others = "، ".join(str(field(item, "code", "key", default="?")) for item in ranked[1:4])
+            lines.append(f"مواد عالية الخطورة التالية: {others}")
+        lines.append("التوصية: خصص فترة ثابتة يومية لهذه المادة قبل أي مراجعة أقل أهمية.")
+        return "\n".join(lines)
 
     def study_sheet_summary(self) -> str:
         return self.study_sheet.summary()
 
-    def today_summary(self) -> str:
-        summary = self.study_sheet_summary()
-        if "ملف ورقة الدراسة غير متوفر" in summary:
-            return summary
-        return "\n".join([
-            "## ملخص اليوم",
-            summary,
-            "",
-            "### توصيّة سريعة",
-            "- ركز أولاً على المادة ذات أعلى مخاطرة/أولوية.",
-            "- حدّد 30-45 دقيقة يومياً لمراجعة CS120 أو المقرر الأضعف.",
-            "- سجل اليوميات قبل نهاية اليوم لتجنب الانقطاع في التقارير.",
-        ])
+    def parent_report(self) -> str:
+        return self.report_builder.build("تقرير الوالد")
 
-    def risk_summary(self) -> str:
-        if not self.study_sheet.is_available():
-            return self.study_sheet_summary()
+    def status_summary(self) -> str:
+        writable = self.store.is_writable()
+        mode = "قراءة + كتابة (Google Sheets)" if writable else ("قراءة فقط (XLSX)" if self.study_sheet.is_available() else "غير متصل")
+        lines = [
+            "## حالة الوكيل",
+            f"التوقيت: {get_timezone_name()} — الآن {now().strftime('%Y-%m-%d %H:%M')}",
+            f"مصدر البيانات: {mode}",
+        ]
+        if writable:
+            sync = self.store.last_sync_at.strftime("%H:%M:%S") if self.store.last_sync_at else "-"
+            lines.append(f"آخر مزامنة شيت: {sync}")
+        if self.store.last_error:
+            lines.append(f"⚠️ آخر خطأ شيت: {self.store.last_error[:160]}")
+        lines.append(f"مزود الذكاء: {self.ai.backend_name()}")
+        lines.append(f"تيليجرام: {len(get_telegram_chat_ids())} مستخدم مصرح")
+        return "\n".join(lines)
 
-        workbook = self.study_sheet.load_workbook()
-        if workbook is None:
-            return "تعذر قراءة ورقة الدراسة للـ risk summary."
+    # ================================================================ actions
 
-        if "Courses" not in workbook.sheetnames:
-            return "لا توجد ورقة باسم Courses في ملف الدراسة."
-
-        rows = list(workbook["Courses"].iter_rows(values_only=True))
-        if not rows:
-            return "لا توجد بيانات في Course sheet."
-
-        entries = []
-        headers = [str(cell).strip() for cell in rows[0]]
-        for row in rows[1:]:
-            if not any(cell is not None and str(cell).strip() for cell in row):
-                continue
-            entry = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
-            entries.append(entry)
-
-        if not entries:
-            return "لا توجد مواد مسجلة."
-
-        ranked = sorted(entries, key=lambda item: (str(item.get("Risk", "")).upper() != "HIGH", float(item.get("Priority", 999) or 999), float(item.get("WeeklyTargetMin", 0) or 0)))
-        top = ranked[0]
-        return (
-            "## تقييم المخاطرة\n"
-            f"أعلى مخاطرة الآن: {top.get('Code', '-')} - {top.get('Name', '-')}\n"
-            f"Risk={top.get('Risk', '-')} | Priority={top.get('Priority', '-')} | Target={top.get('WeeklyTargetMin', '-')} min\n"
-            "التوصية: تخصّص فترة ثابتة يومية لهذه المادة قبل أي مراجعة أقل أهمية."
+    def log_study(self, code: str, minutes: int, note: str = "") -> str:
+        code = _clean_code(code)
+        minutes = _clean_minutes(minutes)
+        if not code:
+            return "حدد رمز المادة. مثال: /log CS120 45"
+        if minutes is None:
+            return "المدة يجب أن تكون بين 1 و600 دقيقة."
+        if not self.store.is_writable():
+            return "وضع القراءة فقط: تسجيل الجلسات يتطلب اتصال الكتابة بالشيت (GOOGLE_SERVICE_ACCOUNT_JSON)."
+        timestamp = now().strftime("%H:%M")
+        ok = self.store.append_row(
+            "SessionLog",
+            [today_iso(), timestamp, code, minutes, note.strip()[:120]],
+            ["Date", "Time", "CourseCode", "Minutes", "Note"],
         )
+        if not ok:
+            return f"تعذر الحفظ في الشيت: {self.store.last_error}"
+        return f"✅ سجلت {minutes} دقيقة على {code} اليوم ({timestamp}). استمر!"
 
     def add_appointment(self, title: str, date: str, time: str = "09:00", note: str = "") -> str:
         return self.scheduler.add(title, date, time, note)
 
     def list_appointments(self) -> str:
-        return self.scheduler.list()
+        return self.scheduler.upcoming()
 
-    def send_alert(self, to_email: str, subject: str, body: str) -> str:
-        return self.alert_manager.send_email(to_email, subject, body)
+    def tasks_overview(self) -> str:
+        return self.tasks.list()
 
-    def execute(self, prompt: str) -> str:
-        text = prompt.strip()
-        if not text:
-            return "No prompt provided."
+    def complete_task(self, query: str) -> str:
+        return self.tasks.mark_done(query)
 
-        lowered = text.lower()
+    def send_parent_report_now(self) -> str:
+        report = self.parent_report()
+        results = []
+        chat_ids = get_telegram_chat_ids()
+        token = get_telegram_token()
+        if token and chat_ids:
+            for chat_id in chat_ids:
+                results.append(self.alert_manager.send_telegram_message(report, chat_id))
+        else:
+            results.append("لم يتم ضبط TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID لإرسال التقرير في تيليجرام.")
+        parent_email = get_parent_email()
+        if parent_email:
+            results.append(self.alert_manager.send_email(parent_email, "تقرير يومي من Study Mentor OS", report))
+        return "\n".join(results)
 
-        if re.search(r"\b(risk|risk summary|check risk|maturity|مخاطرة|تقييم المخاطرة|تحليل المخاطر)\b", lowered):
-            return self.risk_summary()
+    # ================================================================ AI turn
 
-        if re.search(r"\b(today|summary today|daily summary|ملخص اليوم|اليوم)\b", lowered):
-            return self.today_summary()
+    def session_history(self, chat_key: str) -> deque:
+        return self._sessions.setdefault(chat_key, deque(maxlen=12))
 
-        if re.search(r"\b(sheet|workbook|excel|ورقة|جدول|study sheet|ملف الدراسة)\b", lowered):
-            return self.study_sheet_summary()
+    def ai_turn(self, user_text: str, chat_key: str = "default") -> str:
+        """Run one user message through the tool-use loop with short session memory."""
+        if not self.ai.is_available():
+            return self.execute(user_text)
 
-        if re.search(r"\b(report|تقرير|summary|ملخص|parent)\b", lowered):
-            return self.parent_report()
-
-        if re.search(r"\b(appointment|schedule|calendar|event|موعد|تقويم|مواعيد)\b", lowered):
-            if re.search(r"\b(list|show|عرض|مواعيد)\b", lowered):
-                return self.list_appointments()
-            match = re.search(
-                r"(?:add|set|schedule|جد|حجز)\s+(?:appointment|event|موعد|جلسة)?\s*(?P<title>[A-Za-z0-9\u0600-\u06FF _-]+?)\s*(?:on|في|date|التاريخ)\s+(?P<date>\d{4}-\d{2}-\d{2})(?:\s*(?:at|في|time|الوقت)\s+(?P<time>\d{1,2}:\d{2}))?(?:\s*(?:note|ملاحظة)\s+(?P<note>.+))?",
-                text,
-                re.IGNORECASE,
-            )
-            if match:
-                title = match.group("title").strip()
-                date = match.group("date").strip()
-                time = match.group("time") or "09:00"
-                note = (match.group("note") or "").strip()
-                return self.add_appointment(title, date, time, note)
-            return "نمط غير واضح. مثال: أضف موعد مراجعة على 2026-09-17 في 09:00"
-
-        if re.search(r"\b(send|email|alert|تنبيه|بريد)\b", lowered):
-            email_match = re.search(r"(?:to|إلى)\s+([A-Za-z0-9_.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", text, re.IGNORECASE)
-            subject_match = re.search(r"(?:subject|موضوع)\s+(.+?)(?:\s+(?:body|message|الرسالة)|$)", text, re.IGNORECASE)
-            body_match = re.search(r"(?:body|message|الرسالة)\s+(.+)$", text, re.IGNORECASE)
-            if email_match:
-                to_email = email_match.group(1)
-                subject = subject_match.group(1).strip() if subject_match else "تنبيه من Ayman OS Agent"
-                body = body_match.group(1).strip() if body_match else "هذا تنبيه من الوكيل."
-                return self.send_alert(to_email, subject, body)
-
-        if re.search(r"\b(ai|ask|bedrock|chatgpt|assistant|ذكاء|ساعدني|شرح)\b", lowered):
-            prompt_text = re.sub(r"^(?:ai|ask|bedrock|assistant|ذكاء|ساعدني)\s+", "", text, flags=re.IGNORECASE)
-            system_prompt = "أنت مساعد شخصي ذكي. أجب بصياغة عملية وموجزة ومفيدة بالعربية." \
-                if "arabic" in lowered or "عربي" in text else "You are a helpful personal assistant."
-            return self.bedrock.generate(prompt_text, system_prompt)
-
-        if re.search(r"\b(list|show|ls)\b", lowered):
-            path = self._extract_path(text)
-            return self.list_directory(path)
-
-        if re.search(r"\b(read|open|cat|اقرأ|فتح)\b", lowered):
-            path = self._extract_path(text)
-            return self.read_file(path)
-
-        if re.search(r"\b(write|create|save|اكتب|أنشئ|حفظ)\b", lowered):
-            target = self._extract_path(text)
-            content = self._extract_content(text)
-            if not target:
-                return "I need a file path to write to. Example: write /tmp/demo.txt with hello world"
-            if content is None:
-                return "I need content to write. Example: write /tmp/demo.txt with hello world"
-            return self.write_file(target, content)
-
-        if re.search(r"\b(run|execute|shell|command|تشغيل|أمر)\b", lowered):
-            command = self._extract_command(text)
-            return self.run_command(command)
-
-        if self.bedrock.is_available():
-            system_prompt = (
-                "أنت Ayman OS Agent، مساعد شخصي ومرشد دراسي ذكي. "
-                "أجب بصياغة عملية ومفيدة وموجزة."
-            )
-            return self.bedrock.generate(text, system_prompt)
-
-        return (
-            "أستطيع أن أساعدك في: عرض الملفات، قراءة الملفات، كتابة الملفات، تشغيل الأوامر، "
-            "إدارة المواعيد، إعداد التقارير، إرسال التنبيهات، والتفاعل مع AWS Bedrock و Gemini.\n"
-            "أمثلة:\n"
-            "- list current directory\n"
-            "- read README.md\n"
-            "- add appointment review on 2026-09-17 at 09:00\n"
-            "- report\n"
-            "- ask bedrock how to organize my day"
+        current = now()
+        system_prompt = (
+            f"{SYSTEM_PROMPT}\nالتاريخ والوقت الآن: {current.strftime('%Y-%m-%d %H:%M')} بتوقيت {get_timezone_name()}."
         )
 
-    def _resolve_path(self, path: Optional[str]) -> Path:
-        if not path:
-            return self.working_dir
-        candidate = str(path).strip().strip('"\'')
-        resolved = Path(candidate)
-        if not resolved.is_absolute():
-            resolved = (self.working_dir / resolved).resolve()
-        return resolved
+        convo: list[dict] = []
+        for message in self.session_history(chat_key):
+            convo.append({"role": message["role"], "content": [{"text": message["text"]}]})
+        convo.append({"role": "user", "content": [{"text": user_text}]})
 
-    def _extract_path(self, text: str) -> Optional[str]:
+        final_text = ""
+        for _ in range(5):
+            text, calls = self.ai.converse(convo, system_prompt=system_prompt)
+            if not calls:
+                final_text = text or "لم أستطع توليد رد، أعد المحاولة."
+                break
+            assistant_blocks: list[dict] = []
+            if text:
+                assistant_blocks.append({"text": text})
+            for call in calls:
+                assistant_blocks.append(
+                    {"toolUse": {"toolUseId": call["id"], "name": call["name"], "input": call.get("args") or {}}}
+                )
+            convo.append({"role": "assistant", "content": assistant_blocks})
+
+            result_blocks = []
+            for call in calls:
+                outcome = self.execute_tool(call["name"], call.get("args") or {})
+                result_blocks.append(
+                    {
+                        "toolResult": {
+                            "toolUseId": call["id"],
+                            "name": call["name"],
+                            "content": [{"text": outcome[:1200]}],
+                        }
+                    }
+                )
+            convo.append({"role": "user", "content": result_blocks})
+        else:
+            final_text = self.ai.converse(convo, system_prompt=system_prompt, tools=None)[0] or "تمت معالجة طلبك."
+
+        history = self.session_history(chat_key)
+        history.append({"role": "user", "text": user_text})
+        history.append({"role": "assistant", "text": final_text})
+        return final_text
+
+    def execute_tool(self, name: str, args: dict) -> str:
+        """Strict whitelist dispatch. Anything unknown or malformed is rejected."""
+        if name not in TOOL_NAMES:
+            return f"أداة غير معروفة: {name}"
+        args = args if isinstance(args, dict) else {}
+
+        if name == "get_today_summary":
+            return self.today_summary()
+        if name == "get_risk":
+            return self.risk_summary()
+        if name == "list_tasks":
+            return self.tasks_overview()
+        if name == "list_appointments":
+            return self.list_appointments()
+        if name == "send_parent_report":
+            return self.send_parent_report_now()
+        if name == "log_study":
+            return self.log_study(args.get("code"), args.get("minutes"), str(args.get("note") or ""))
+        if name == "mark_task_done":
+            query = str(args.get("query") or args.get("task") or "").strip()
+            if not query:
+                return "حدد المهمة المطلوب إنجازها."
+            return self.complete_task(query)
+        if name == "add_appointment":
+            title = str(args.get("title") or "").strip()
+            date_value = str(args.get("date") or "").strip()
+            time_value = str(args.get("time") or "09:00").strip()
+            if not title:
+                return "عنوان الموعد مطلوب."
+            if parse_date(date_value) is None:
+                return "تاريخ غير صالح، استخدم YYYY-MM-DD."
+            parsed_time = parse_time(time_value)
+            if parsed_time is None:
+                return "وقت غير صالح، استخدم HH:MM."
+            return self.add_appointment(title, date_value, parsed_time.strftime("%H:%M"))
+        return f"أداة غير مطبقة: {name}"
+
+    # ================================================================ fast path (no AI)
+
+    def execute(self, prompt: str) -> str:
+        """Keyword router used for direct commands and as the no-AI fallback."""
+        text = (prompt or "").strip()
+        if not text:
+            return "اكتب سؤالك أو استخدم /help."
+
         lowered = text.lower()
-        if any(keyword in lowered for keyword in ["current directory", "working directory", "this directory", "الدليل الحالي", "الدليل الحالي"]):
-            return "."
 
-        patterns = [
-            r"(?:read|open|list|show|write|create|save|اقرأ|فتح|اعرض|اكتب|أنشئ|حفظ)\s+(?:the\s+)?(?P<path>\"[^\"]+\"|'[^']+'|[A-Za-z0-9_.:/\\-]+(?:\s+[A-Za-z0-9_.:/\\-]+)*)",
-            r"(?:in|at|for|to|في|على|إلى)\s+(?:the\s+)?(?P<path>\"[^\"]+\"|'[^']+'|[A-Za-z0-9_.:/\\-]+(?:\s+[A-Za-z0-9_.:/\\-]+)*)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                value = match.group("path").strip().strip('"\'')
-                value = re.split(r"\s+(?:with|and|then|from|to|مع|و|ثم|من|إلى)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-                if value.lower() in {"with", "and", "then", "from", "to", "مع", "و", "ثم", "من", "إلى"}:
-                    continue
-                return value
-        return None
+        if re.search(r"risk|maturity|مخاطر|مخاطرة|أخطر|اخطر", lowered):
+            return self.risk_summary()
+        if re.search(r"today|summary|ملخص|اليوم|وضع اليوم", lowered):
+            return self.today_summary()
+        if re.search(r"sheet|workbook|ورقة|الشيت", lowered):
+            return self.study_sheet_summary()
+        if re.search(r"appointment|schedule|موعد|مواعيد|تقويم", lowered):
+            return self.list_appointments()
+        if re.search(r"tasks?|مهام|مهمة|واجب|واجبات", lowered):
+            return self.tasks_overview()
+        if re.search(r"report|تقرير", lowered):
+            return self.parent_report()
+        if re.search(r"status|حالة", lowered):
+            return self.status_summary()
+        return (
+            "لم أفهم الطلب بدقة. جرّب:\n"
+            "- /summary ملخص اليوم\n"
+            "- /risk المواد الأخطر\n"
+            "- /log CS120 45 لتسجيل جلسة\n"
+            "- /tasks و /done\n"
+            "- أو اكتب سؤالك بحرية ليجيب المرشد الذكي."
+        )
 
-    def _extract_content(self, text: str) -> Optional[str]:
-        match = re.search(r"(?:with|content|مع|محتوى)\s+(.*)$", text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return None
 
-    def _extract_command(self, text: str) -> str:
-        match = re.search(r"(?:run|execute|command|تشغيل|أمر)\s+(.*)$", text, re.IGNORECASE)
-        return match.group(1).strip() if match else text
-
+# ================================================================ CLI
 
 def interactive_loop() -> None:
     agent = OSAgent()
+    print("Study Mentor OS — وضع تفاعلي (أوامر آمنة فقط). اكتب «خروج» للخروج.")
     while True:
         try:
-            prompt = input("ayman-os-agent> ")
+            prompt = input("study-mentor> ")
         except EOFError:
             print()
             return
         if prompt.strip().lower() in {"exit", "quit", "bye", "خروج"}:
-            print("Goodbye.")
+            print("إلى اللقاء!")
             return
-        result = agent.execute(prompt)
-        print(result)
+        print(agent.ai_turn(prompt) if agent.ai.is_available() else agent.execute(prompt))
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Ayman OS Agent")
-    parser.add_argument("prompt", nargs="?", help="Natural language task to execute")
-    parser.add_argument("--list", dest="list_path", help="List files in a path")
-    parser.add_argument("--read", dest="read_path", help="Read a file")
-    parser.add_argument("--write", nargs=2, metavar=("PATH", "TEXT"), help="Write text to a file")
-    parser.add_argument("--run", dest="run_command", help="Run a shell command")
-    parser.add_argument("--sheet", action="store_true", help="Show the study workbook summary")
-    parser.add_argument("--risk", action="store_true", help="Show the highest risk academic course")
-    parser.add_argument("--summary", action="store_true", help="Show a daily study summary")
-    parser.add_argument("--interactive", action="store_true", help="Enter the REPL loop")
-    parser.add_argument("--cwd", default=os.getcwd(), help="Working directory for the agent")
+    parser = argparse.ArgumentParser(description="Study Mentor OS agent (safe, sheet-backed)")
+    parser.add_argument("prompt", nargs="?", help="سؤال أو أمر بالعربية أو الإنجليزية")
+    parser.add_argument("--sheet", action="store_true", help="ملخص ورقة الدراسة")
+    parser.add_argument("--risk", action="store_true", help="المادة الأعلى مخاطرة")
+    parser.add_argument("--summary", action="store_true", help="ملخص اليوم")
+    parser.add_argument("--tasks", action="store_true", help="المهام المفتوحة")
+    parser.add_argument("--report", action="store_true", help="تقرير الوالد")
+    parser.add_argument("--status", action="store_true", help="حالة النظام")
+    parser.add_argument("--interactive", action="store_true", help="وضع تفاعلي")
     args = parser.parse_args(argv)
 
-    agent = OSAgent(args.cwd)
+    agent = OSAgent()
 
     if args.interactive:
         interactive_loop()
         return 0
-
-    if args.list_path:
-        print(agent.list_directory(args.list_path))
-        return 0
-    if args.read_path:
-        print(agent.read_file(args.read_path))
-        return 0
-    if args.write:
-        path, content = args.write
-        print(agent.write_file(path, content))
-        return 0
-    if args.run_command:
-        print(agent.run_command(args.run_command))
-        return 0
     if args.sheet:
         print(agent.study_sheet_summary())
-        return 0
-    if args.risk:
+    elif args.risk:
         print(agent.risk_summary())
-        return 0
-    if args.summary:
+    elif args.summary:
         print(agent.today_summary())
-        return 0
-    if args.prompt is not None:
-        print(agent.execute(args.prompt))
-        return 0
-
-    print("Ayman OS Agent\nUse --help for commands or run --interactive.")
+    elif args.tasks:
+        print(agent.tasks_overview())
+    elif args.report:
+        print(agent.parent_report())
+    elif args.status:
+        print(agent.status_summary())
+    elif args.prompt is not None:
+        print(agent.ai_turn(args.prompt) if agent.ai.is_available() else agent.execute(args.prompt))
+    else:
+        parser.print_help()
     return 0
 
 
